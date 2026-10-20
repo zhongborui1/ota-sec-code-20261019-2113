@@ -3,7 +3,8 @@
     <div class="card">
       <h2>信任元数据（共 {{ keys.length }} 把签名密钥）</h2>
       <button class="btn" @click="load">刷新</button>
-      <p style="margin-top: 8px; color: #666;">Trust anchor version: {{ trust.trust_anchor_version }}</p>
+      <p style="margin-top: 8px; color: #666;">根签名策略版本：{{ trust.version }}（根公钥保持预置）</p>
+      <p>密钥状态由离线签发的策略授权，轮换需使用 scripts/17-security-admin.py。</p>
       <table style="margin-top: 12px;">
         <tr>
           <th>Key ID</th>

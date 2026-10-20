@@ -21,8 +21,15 @@ from flask import Flask, request, jsonify, g
 
 import security
 from security import Deny
+from ota_common.trust import (device_record, enrollment_message, verify_sm2,
+                              SecurityError)
+DEVICE_REGISTRY = Path(os.environ.get("DEVICE_REGISTRY", "/keys/device-registry"))
 
 app = Flask(__name__)
+@app.errorhandler(SecurityError)
+def security_error(exc):
+    return jsonify({"error": str(exc)}), 403
+
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
 KEY_DIR = Path(os.environ.get("KEY_DIR", "/keys"))
@@ -248,84 +255,25 @@ def pubkey(key_id):
 @app.route("/ecu_keygen", methods=["POST"])
 @require("ecu:provision")
 def ecu_keygen():
-    """为指定 VIN 生成独立 SM2 密钥对（幂等）。私钥不出 /keys/ecu-pool。"""
-    body = request.get_json(force=True)
-    vin = body.get("vin")
-    if not vin or not VIN_RE.fullmatch(vin):
-        return jsonify({"error": "invalid or missing vin"}), 400
-
-    safe_vin = "".join(c for c in vin if c.isalnum())
-    d = KEY_DIR / "ecu-pool" / safe_vin
-    key_file = d / "ecu.key"
-    pub_file = d / "ecu.pub"
-
-    if pub_file.exists():
-        return jsonify({"pub_hex": pub_file.read_text(), "created": False,
-                        "vin": safe_vin})
-
-    d.mkdir(parents=True, exist_ok=True)
-    key_pass = f"ecupass-{safe_vin}"
-    rc, _, err = run_gmssl([
-        "sm2keygen", "-pass", key_pass,
-        "-out", str(key_file), "-pubout", str(pub_file),
-    ])
-    if rc != 0:
-        return jsonify({"error": "keygen failed",
-                        "stderr": err.decode(errors="ignore")}), 500
-
-    os.chmod(key_file, 0o600)
-    os.chmod(pub_file, 0o644)
-    security.log_decision(caller=g.caller, action="ecu_keygen",
-                          decision="allow", vin=safe_vin)
-    return jsonify({"pub_hex": pub_file.read_text(), "created": True,
-                    "vin": safe_vin})
+    # Retained internal name; this endpoint never generates or exports a private key.
+    record = device_record(DEVICE_REGISTRY, request.get_json(force=True).get("vin"))
+    return jsonify({"pub_hex": record["public_key"], "created": False, "vin": record["vin"]})
 
 
 @app.route("/verify_device_pop", methods=["POST"])
 @require("ecu:provision")
 def verify_device_pop():
     body = request.get_json(force=True)
-    vin = body.get("vin")
-    nonce = body.get("nonce")
-    sig_hex = body.get("sig_hex")
-    pub_pem = body.get("pub_pem")
-    if not all([vin, nonce, sig_hex, pub_pem]):
-        return jsonify({"error": "missing fields"}), 400
-    if not VIN_RE.fullmatch(vin):
-        return jsonify({"error": "invalid vin"}), 400
-    if len(nonce) > 256 or len(pub_pem) > 4096:
-        return jsonify({"error": "input too large"}), 413
-
-    safe_vin = "".join(c for c in vin if c.isalnum())
-    d = KEY_DIR / "ecu-pool" / safe_vin
-    d.mkdir(parents=True, exist_ok=True)
-    pub_path = d / "ecu.pub"
-    pub_path.write_text(pub_pem)
-
-    with tempfile.NamedTemporaryFile("w", delete=False) as f:
-        f.write(nonce)
-        nonce_path = f.name
-    sig_path = nonce_path + ".sig"
-    Path(sig_path).write_bytes(bytes.fromhex(sig_hex))
-
-    try:
-        rc, out, err = run_gmssl([
-            "sm2verify", "-pubkey", str(pub_path), "-id", vin,
-            "-in", nonce_path, "-sig", sig_path,
-        ])
-        if rc != 0 or b"success" not in out.lower():
-            pub_path.unlink(missing_ok=True)
-            security.log_decision(caller=g.caller, action="verify_device_pop",
-                                  decision="deny", reason="pop_failed",
-                                  vin=safe_vin)
-            return jsonify({"valid": False,
-                            "stderr": err.decode(errors="ignore")}), 400
-        security.log_decision(caller=g.caller, action="verify_device_pop",
-                              decision="allow", vin=safe_vin)
-        return jsonify({"valid": True, "vin": safe_vin})
-    finally:
-        Path(nonce_path).unlink(missing_ok=True)
-        Path(sig_path).unlink(missing_ok=True)
+    vin, nonce, pub = body.get("vin"), body.get("nonce"), body.get("pub_pem")
+    record = device_record(DEVICE_REGISTRY, vin)
+    if not isinstance(nonce, str) or not re.fullmatch(r"[a-f0-9]{64}", nonce):
+        return jsonify({"error": "invalid_nonce"}), 400
+    if not isinstance(pub, str) or pub.strip() != record["public_key"].strip():
+        return jsonify({"error": "unapproved_public_key"}), 403
+    valid = verify_sm2(record["public_key"], enrollment_message(vin, nonce, pub),
+                       body.get("sig_hex"), vin)
+    # Verification uses temporary files only; registered public keys are read-only.
+    return jsonify({"valid": valid, "vin": vin}), 200 if valid else 403
 
 
 @app.route("/sm2_encrypt", methods=["POST"])
@@ -346,9 +294,11 @@ def sm2_encrypt():
         return jsonify({"error": "only 16-byte content keys may be wrapped"}), 400
 
     safe_vin = "".join(c for c in vin if c.isalnum())
-    pub_path = KEY_DIR / "ecu-pool" / safe_vin / "ecu.pub"
-    if not pub_path.exists():
-        return jsonify({"error": f"ECU key not found for VIN {safe_vin}"}), 500
+    record = device_record(DEVICE_REGISTRY, vin)
+    pub_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    pub_file.write(record["public_key"])
+    pub_file.close()
+    pub_path = Path(pub_file.name)
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         f.write(plain)
@@ -365,6 +315,7 @@ def sm2_encrypt():
         wrapped = Path(out_path).read_bytes()
         return jsonify({"wrapped_hex": wrapped.hex(), "wrapped_len": len(wrapped)})
     finally:
+        pub_path.unlink(missing_ok=True)
         Path(in_path).unlink(missing_ok=True)
         Path(out_path).unlink(missing_ok=True)
 

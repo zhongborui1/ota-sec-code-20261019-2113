@@ -16,8 +16,9 @@ RUN git clone --depth 1 https://github.com/guanzhi/GmSSL.git /tmp/GmSSL && \
 RUN pip3 install --no-cache-dir flask gunicorn --break-system-packages
 
 WORKDIR /app
-COPY app.py .
-COPY security.py .
+COPY signing-service/app.py .
+COPY signing-service/security.py .
+COPY ota_common /app/ota_common
 
 EXPOSE 8081
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8081", "app:app"]

@@ -44,14 +44,13 @@ def iso(dt):
 
 
 def active_signing_key():
-    try:
-        trust = json.loads(TRUST_FILE.read_text())
-        for key_id, info in trust.get("keys", {}).items():
-            if info.get("status") == "active":
-                return key_id
-    except Exception:
-        pass
-    return "ota-signing-v2"
+    from ota_common.trust import verify_policy, trusted_key
+    trust = verify_policy(json.loads(TRUST_FILE.read_text()), ROOT / 'pki/root/root.pub')
+    for key_id, info in trust['keys'].items():
+        if info['status'] == 'active':
+            trusted_key(trust, key_id)
+            return key_id
+    raise SystemExit('No trusted active signing key')
 
 
 def sign_grant(grant):

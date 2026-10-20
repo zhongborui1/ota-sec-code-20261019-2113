@@ -14,30 +14,29 @@
       slots/slot_b/{...}
 
 出厂基线：
-  首个升级包到达时，用它的明文镜像生成一份"旧版本"基线（版本取 min_version，
-  rollback_index 取新版本 -1，后 10 个分块内容不同），只保留一份
-  data/vehicle-state/_factory/payload.bin（100 MB），各车 slot_a 用硬链接引用。
-  这样 100 辆车不会为回滚目标多占 10 GB，同时 Slot A 仍是可独立校验的完整镜像。
-  出厂镜像没有 OTA 签名，启动自检只校验完整性（与真实 ECU 回退启动一致）。
+  管理员离线审核并用根私钥签署 factory.json，不再从下载包自动生成可信基线。
+  各车 Slot A 可硬链接共享 payload.bin，启动时验证根签名和实际镜像摘要。
 """
-import fcntl
 import hashlib
 import json
 import os
 import shutil
 import subprocess
-import tempfile
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(os.environ.get("OTA_ROOT", "/home/rjh/ota-sec"))
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ota_common.trust import (SecurityError, verify_sm2, canonical, cached_policy,
+                              trusted_key, atomic_json, timestamp)
+ROOT = Path(os.environ.get("OTA_ROOT", str(Path(__file__).resolve().parents[2])))
 VEHICLE_STATE = ROOT / "data" / "vehicle-state"
 FACTORY_DIR = VEHICLE_STATE / "_factory"
 TRUST_ANCHORS = ROOT / "pki" / "vehicle-trust"
 
 MAX_BOOT_ATTEMPTS = 3
-FACTORY_DIVERGE_LAST = 10          # 出厂镜像与新版不同的最后 N 个分块
 
 
 def _now():
@@ -67,10 +66,7 @@ def boot_state_path(vin):
 
 
 def _atomic_write_json(path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
-    os.replace(tmp, path)
+    atomic_json(path, obj)
 
 
 def _md5_of_file(path):
@@ -100,64 +96,15 @@ def scan_file(path, chunk_size):
 
 # ---------- 出厂基线 ----------
 
-def ensure_factory_image(source_plain, manifest, lock_timeout=120):
-    """
-    幂等创建共享出厂镜像。source_plain 是本次已验证的明文 payload。
-    只有第一个线程真正构建，其余等待后复用。
-    """
-    chunk_size = int(manifest["chunk_size"])
-    meta_path = FACTORY_DIR / "meta.json"
-    payload_path = FACTORY_DIR / "payload.bin"
-
-    if meta_path.exists() and payload_path.exists():
-        meta = json.loads(meta_path.read_text())
-        if meta.get("chunk_size") == chunk_size:
-            return meta
-
-    FACTORY_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = FACTORY_DIR / ".lock"
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # 双检：等锁期间别人可能已经建好
-        if meta_path.exists() and payload_path.exists():
-            meta = json.loads(meta_path.read_text())
-            if meta.get("chunk_size") == chunk_size:
-                return meta
-
-        tmp = FACTORY_DIR / f"payload.bin.tmp.{os.getpid()}"
-        shutil.copyfile(source_plain, tmp)
-
-        size = tmp.stat().st_size
-        n_chunks = (size + chunk_size - 1) // chunk_size
-
-        # 把最后 N 块改成不同内容，让它成为"另一份镜像"而不是新版的副本
-        with open(tmp, "r+b") as f:
-            for i in range(max(0, n_chunks - FACTORY_DIVERGE_LAST), n_chunks):
-                offset = i * chunk_size
-                length = min(chunk_size, size - offset)
-                f.seek(offset)
-                f.write(b"\xAA" * length)
-            f.flush()
-            os.fsync(f.fileno())
-
-        sm3, chunk_hashes = scan_file(tmp, chunk_size)
-        os.replace(tmp, payload_path)
-
-        meta = {
-            "kind": "factory_baseline",
-            "version": manifest.get("min_version") or "0.0.0",
-            "rollback_index": max(0, int(manifest["rollback_index"]) - 1),
-            "size": size,
-            "chunk_size": chunk_size,
-            "chunk_count": n_chunks,
-            "sm3": sm3,
-            "chunk_hashes": chunk_hashes,
-            "diverge_last_chunks": FACTORY_DIVERGE_LAST,
-            "created_at": _now(),
-            "source_package": manifest.get("package_id"),
-        }
-        _atomic_write_json(meta_path, meta)
-        return meta
+def ensure_factory_image(source_plain=None, manifest=None, lock_timeout=120):
+    # Factory baseline is approved offline; never derived/trusted from a downloaded OTA.
+    doc = json.loads((FACTORY_DIR / "factory.json").read_text())
+    meta = doc["signed"]
+    root_pub = (TRUST_ANCHORS / "root.pub").read_text()
+    if meta.get("type") != "ota-factory-v1" or not verify_sm2(
+            root_pub, canonical(meta), doc["signature"], "ota-root-v1"):
+        raise SecurityError("factory_bad_root_signature")
+    return meta
 
 
 def _link_factory_payload(vin):
@@ -185,9 +132,6 @@ def init_vehicle(vin, manifest, source_plain):
     返回 (state, factory_meta)。
     """
     meta = ensure_factory_image(source_plain, manifest)
-    factory_meta_path = FACTORY_DIR / "meta.json"
-    if not factory_meta_path.exists():
-        raise RuntimeError("factory meta missing")
 
     d = slot_dir(vin, "slot_a")
     d.mkdir(parents=True, exist_ok=True)
@@ -222,6 +166,7 @@ def init_vehicle(vin, manifest, source_plain):
             "confirmed_slot": "slot_a",
             "pending_slot": None,
             "phase": "COMMITTED",
+            "rollback_index": int(meta["rollback_index"]),
             "boot_counter": 0,
             "max_boot_attempts": MAX_BOOT_ATTEMPTS,
             "history": [{
@@ -233,13 +178,12 @@ def init_vehicle(vin, manifest, source_plain):
         }
         _atomic_write_json(p, state)
 
-    # 防回滚下限：出厂分区自身就是 ri=11，本地计数器不能停留在更低的默认值，
-    # 否则回退后仍会接受 ri=11 的"降级包"。
+    # 出厂基线也建立防回滚下限，不能从更低的默认值开始。
     ri_file = vehicle_dir(vin) / "rollback_index"
     if not ri_file.exists():
-        ri_file.write_text(str(meta["rollback_index"]))
+        atomic_json(ri_file, int(meta["rollback_index"]))
     elif int(ri_file.read_text().strip() or 0) < int(meta["rollback_index"]):
-        ri_file.write_text(str(meta["rollback_index"]))
+        atomic_json(ri_file, int(meta["rollback_index"]))
 
     return state, meta
 
@@ -303,7 +247,7 @@ def _fsync_dir(path):
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError:
+    except (OSError, AttributeError):
         pass
 
 
@@ -324,110 +268,60 @@ def corrupt_slot(vin, slot, chunk_idx=5, offset=123):
 
 # ---------- 启动自检 ----------
 
-def _verify_manifest_signature(manifest, sig_hex, key_id):
-    """离线验签：只用本地信任锚，启动阶段不访问云端。"""
-    anchor = TRUST_ANCHORS / f"{key_id}.pub"
-    if not anchor.exists():
-        return False, f"trust_anchor_missing: {anchor.name}"
-    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False).encode("utf-8")
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(canonical)
-        in_path = f.name
-    sig_path = in_path + ".sig"
-    Path(sig_path).write_bytes(bytes.fromhex(sig_hex))
-    try:
-        r = subprocess.run([
-            "gmssl", "sm2verify",
-            "-pubkey", str(anchor), "-id", key_id,
-            "-in", in_path, "-sig", sig_path,
-        ], capture_output=True)
-        ok = (r.returncode == 0 and b"success" in r.stdout.lower())
-        return ok, "ok" if ok else f"sm2_verify_failed: {r.stderr.decode(errors='ignore')[:120]}"
-    finally:
-        Path(in_path).unlink(missing_ok=True)
-        Path(sig_path).unlink(missing_ok=True)
-
-
 def verify_slot(vin, slot, reference_slot=None):
-    """
-    启动自检：完整性 → 元数据一致性 → 防回滚 → （OTA 镜像）离线验签。
-    返回 {ok, reason, version, rollback_index, detail}。
-    """
-    d = slot_dir(vin, slot)
-    meta_path = d / "meta.json"
-    payload = d / "payload.bin"
-    if not meta_path.exists() or not payload.exists():
-        return {"ok": False, "reason": "slot_empty", "slot": slot}
-
-    meta = json.loads(meta_path.read_text())
-    chunk_size = int(meta["chunk_size"])
-    expected_chunks = meta["chunk_hashes"]
-
-    # 1. 逐块 + 整包 SM3，一次顺序读
-    whole = hashlib.new("sm3")
-    idx = 0
-    with open(payload, "rb") as f:
-        while True:
-            b = f.read(chunk_size)
-            if not b:
-                break
-            whole.update(b)
-            if idx >= len(expected_chunks):
-                return {"ok": False, "slot": slot,
-                        "reason": f"chunk_count_overflow: {idx}"}
-            actual = _sm3_hex(b)
-            if actual != expected_chunks[idx]:
-                return {"ok": False, "slot": slot,
-                        "reason": f"chunk_{idx}_hash_mismatch"}
-            idx += 1
-
-    if idx != len(expected_chunks):
-        return {"ok": False, "slot": slot,
-                "reason": f"chunk_count_mismatch: {idx} != {len(expected_chunks)}"}
-    if whole.hexdigest() != meta["sm3"]:
-        return {"ok": False, "slot": slot, "reason": "payload_sm3_mismatch"}
-    if payload.stat().st_size != int(meta["size"]):
-        return {"ok": False, "slot": slot, "reason": "payload_size_mismatch"}
-
-    # 2. manifest 与 slot 元数据一致
-    manifest = json.loads((d / "manifest.json").read_text()) if (d / "manifest.json").exists() else None
-    if meta.get("provenance") == "ota":
-        if manifest is None:
-            return {"ok": False, "slot": slot, "reason": "manifest_missing"}
-        if manifest.get("vin") != vin or meta.get("vin") != vin:
-            return {"ok": False, "slot": slot, "reason": "vin_mismatch"}
-        if manifest.get("version") != meta.get("version"):
-            return {"ok": False, "slot": slot, "reason": "version_mismatch"}
-        if int(manifest.get("rollback_index", -1)) != int(meta.get("rollback_index", -2)):
-            return {"ok": False, "slot": slot, "reason": "rollback_index_mismatch"}
-
-    # 3. 防回滚：待启动镜像的 rollback_index 不得低于当前活动分区
-    if reference_slot and reference_slot != slot:
-        ref_meta_path = slot_dir(vin, reference_slot) / "meta.json"
-        if ref_meta_path.exists():
-            ref = json.loads(ref_meta_path.read_text())
-            if int(meta["rollback_index"]) < int(ref.get("rollback_index", 0)):
-                return {"ok": False, "slot": slot,
-                        "reason": f"rollback_index_regression: "
-                                  f"{ref.get('rollback_index')} -> {meta['rollback_index']}"}
-
-    # 4. OTA 镜像离线验签
-    if meta.get("signature_verified"):
-        sig_path = d / "manifest.sig"
-        if not sig_path.exists():
-            return {"ok": False, "slot": slot, "reason": "signature_missing"}
-        ok, reason = _verify_manifest_signature(
-            manifest, sig_path.read_bytes().hex().strip(),
-            manifest.get("key_id") or meta.get("key_id"))
-        if not ok:
-            return {"ok": False, "slot": slot, "reason": reason}
-
-    return {"ok": True, "slot": slot, "reason": "ok",
-            "version": meta.get("version"),
-            "rollback_index": meta.get("rollback_index"),
-            "signature_checked": bool(meta.get("signature_verified")),
-            "provenance": meta.get("provenance")}
+    """Authority is the signed manifest/root baseline, never mutable slot metadata."""
+    try:
+        d = slot_dir(vin, slot)
+        payload = d / "payload.bin"
+        meta = json.loads((d / "meta.json").read_text())
+        if (d / "manifest.json").exists():
+            manifest = json.loads((d / "manifest.json").read_text())
+            if manifest.get("vin") != vin or manifest.get("key_id") != meta.get("key_id"):
+                raise SecurityError("vin_or_key_mismatch")
+            state = json.loads(boot_state_path(vin).read_text())
+            installed = state.get("confirmed_slot") == slot and state.get("pending_slot") != slot
+            if not installed and timestamp(manifest.get('expires_at')) <= time.time():
+                raise SecurityError('manifest_expired')
+            policy = cached_policy(vehicle_dir(vin) / "trust.sqlite3",
+                                   TRUST_ANCHORS / "root.pub", allow_expired=installed)
+            pub = trusted_key(policy, manifest.get("key_id"), installed=installed)
+            sig = (d / "manifest.sig").read_bytes().hex()
+            if not verify_sm2(pub, canonical(manifest), sig, manifest["key_id"]):
+                raise SecurityError("sm2_verify_failed")
+            authority = manifest
+            signature_checked = True
+        else:
+            # Only the exact root-approved baseline qualifies for this branch.
+            authority = ensure_factory_image()
+            signature_checked = True
+        for field in ('version', 'rollback_index', 'size', 'chunk_size', 'sm3'):
+            if meta.get(field) != authority.get(field):
+                raise SecurityError('metadata_manifest_mismatch:' + field)
+        if meta.get('vin') != vin:
+            raise SecurityError('vin_mismatch')
+        state = json.loads(boot_state_path(vin).read_text())
+        floor = int(state.get('rollback_index', 0))
+        counter = vehicle_dir(vin) / 'rollback_index'
+        if counter.exists():
+            floor = max(floor, int(counter.read_text().strip()))
+        if authority['rollback_index'] < floor:
+            raise SecurityError('rollback_index_regression')
+        if payload.stat().st_size != authority['size']:
+            raise SecurityError('payload_size_mismatch')
+        actual, _ = scan_file(payload, int(authority['chunk_size']))
+        if actual != authority['sm3']:
+            raise SecurityError('payload_sm3_mismatch')
+        if reference_slot and reference_slot != slot:
+            ref = verify_slot(vin, reference_slot)
+            if not ref['ok']:
+                raise SecurityError('reference_slot_invalid')
+            if authority['rollback_index'] < ref['rollback_index']:
+                raise SecurityError('rollback_index_regression')
+        return {'ok': True, 'slot': slot, 'reason': 'ok',
+                'version': authority['version'], 'rollback_index': authority['rollback_index'],
+                'signature_checked': signature_checked}
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        return {'ok': False, 'slot': slot, 'reason': str(exc)}
 
 
 def boot_once(vin):
@@ -460,6 +354,8 @@ def boot_once(vin):
         state["confirmed_slot"] = pending
         state["pending_slot"] = None
         state["phase"] = "COMMITTED"
+        # 和提交状态一起落盘，避免主进程在 save_rollback 前中断后降低防降级下限。
+        state["rollback_index"] = max(int(state.get("rollback_index", 0)), check["rollback_index"])
         state["boot_counter"] = 0
         state.setdefault("history", []).append({
             "at": _now(), "event": "boot_ok_and_confirmed", "slot": pending,

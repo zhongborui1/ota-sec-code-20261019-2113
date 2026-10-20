@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -92,6 +93,8 @@ def verify_policy(doc, root_pub, now=None, allow_expired=False):
     keys = p.get('keys')
     if not isinstance(keys, dict) or not keys:
         raise SecurityError('policy_keys')
+    if not all(isinstance(k, dict) for k in keys.values()):
+        raise SecurityError('policy_key_schema')
     if sum(k.get('status') == 'active' for k in keys.values()) != 1:
         raise SecurityError('policy_requires_one_active_key')
     for kid, k in keys.items():
@@ -112,7 +115,7 @@ def accept_policy(doc, root_pub, state_db, now=None):
     p = verify_policy(doc, root_pub, now)
     state_db = Path(state_db)
     state_db.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(state_db, timeout=30) as db:
+    with closing(sqlite3.connect(state_db, timeout=30)) as db, db:
         db.execute('PRAGMA synchronous=FULL')
         db.execute('CREATE TABLE IF NOT EXISTS trust (id INTEGER PRIMARY KEY, version INTEGER, document TEXT)')
         db.execute('BEGIN IMMEDIATE')
@@ -143,7 +146,7 @@ def accept_policy(doc, root_pub, state_db, now=None):
 def cached_policy(state_db, root_pub, allow_expired=False):
     if not Path(state_db).exists():
         raise SecurityError('no_trusted_policy')
-    with sqlite3.connect(state_db) as db:
+    with closing(sqlite3.connect(state_db)) as db:
         row = db.execute('SELECT document FROM trust WHERE id=1').fetchone()
     if not row:
         raise SecurityError('no_trusted_policy')
@@ -182,7 +185,7 @@ def device_record(directory, vin):
         d = json.loads((Path(directory) / (vin + '.json')).read_text())
     except (OSError, ValueError) as exc:
         raise SecurityError('device_not_provisioned') from exc
-    if d.get('vin') != vin or d.get('enabled') is not True or not d.get('public_key'):
+    if not isinstance(d, dict) or d.get('vin') != vin or d.get('enabled') is not True or not isinstance(d.get('public_key'), str):
         raise SecurityError('device_disabled_or_invalid')
     return d
 

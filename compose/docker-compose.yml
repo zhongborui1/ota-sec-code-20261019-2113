@@ -33,7 +33,9 @@ services:
     networks: [ota-internal]
 
   signing-service:
-    build: ../services/signing-service
+    build:
+      context: ../services
+      dockerfile: signing-service/Dockerfile
     user: "1000:1000"
     container_name: ota-signing-service
     environment:
@@ -44,6 +46,7 @@ services:
       SERVICE_REGISTRY: /keys/service-auth/identities.json
       RELEASE_ANCHOR_DIR: /keys/release-v1
       ROOT_PUB: /keys/root.pub
+      DEVICE_REGISTRY: /keys/device-registry
       TRUST_FILE: /data/trust/trust-metadata.json
       AUTH_DB: /var/lib/ota-auth/authz.db
       AUDIT_FILE: /var/lib/ota-auth/audit.jsonl
@@ -61,17 +64,18 @@ services:
       - ../pki/release-v1/release.cert.json:/keys/release-v1/release.cert.json:ro
       - ../pki/release-v1/release.cert.sig:/keys/release-v1/release.cert.sig:ro
       - ../pki/release-v1/release.pub:/keys/release-v1/release.pub:ro
-      - ../pki/service-auth:/keys/service-auth:ro
-      - ../pki/ecu-pool:/keys/ecu-pool:rw
-      - ../pki/ecu-local:/keys/ecu-local:ro
-      - ../pki/ecu-demo:/keys/ecu-demo:ro
+      - ../pki/service-auth/identities.json:/keys/service-auth/identities.json:ro
+      - ../pki/service-auth/ota-api.key:/keys/service-auth/ota-api.key:ro
+      - ../pki/device-registry:/keys/device-registry:ro
       # 授权库（nonce/配额/签名审计）与只读信任元数据
       - ../data/signing-auth:/var/lib/ota-auth:rw
       - ../data/trust:/data/trust:ro
     networks: [ota-internal]
 
   ota-api:
-    build: ../services/ota-api
+    build:
+      context: ../services
+      dockerfile: ota-api/Dockerfile
     container_name: ota-api
     environment:
       SIGNING_URL: http://ota-signing-service:8081
@@ -79,12 +83,11 @@ services:
       SIGNING_SECRET_FILE: /keys/service-auth/ota-api.key
       RELEASE_GRANT_DIR: /data/release-grants
       ADMIN_TOKEN_FILE: /keys/service-auth/admin.token
-      GRACE_PERIOD_S: "5"
-      CLEANUP_INTERVAL_S: "1"
+      ROOT_PUB: /keys/root.pub
+      DEVICE_REGISTRY: /keys/device-registry
       PACKAGES_DIR: /data/packages
       TASKS_DIR: /data/tasks
       TRUST_FILE: /data/trust/trust-metadata.json
-      TRUST_TTL: "60"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
@@ -97,11 +100,12 @@ services:
     volumes:
       - ../packages:/data/packages:ro
       - ../data/tasks:/data/tasks
-      - ../data/trust:/data/trust
+      - ../data/trust:/data/trust:ro
       - ../data/release-grants:/data/release-grants:ro
-      - ../pki/service-auth:/keys/service-auth:ro
-      - ../pki/ecu-pool:/keys/ecu-pool:ro
-      - ../pki/ecu-local:/keys/ecu-local:ro
+      - ../pki/service-auth/ota-api.key:/keys/service-auth/ota-api.key:ro
+      - ../pki/service-auth/admin.token:/keys/service-auth/admin.token:ro
+      - ../pki/root/root.pub:/keys/root.pub:ro
+      - ../pki/device-registry:/keys/device-registry:ro
     networks: [ota-internal]
     depends_on:
       - signing-service

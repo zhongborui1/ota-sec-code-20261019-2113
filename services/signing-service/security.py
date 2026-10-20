@@ -36,6 +36,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ota_common.trust import accept_policy, effective_policy, trusted_key
 
 AUTH_DB = Path(os.environ.get("AUTH_DB", "/var/lib/ota-auth/authz.db"))
 AUDIT_FILE = Path(os.environ.get("AUDIT_FILE", "/var/lib/ota-auth/audit.jsonl"))
@@ -422,18 +425,13 @@ _trust_cache = {"data": None, "mtime": None, "at": 0.0}
 
 
 def signing_key_status(key_id):
-    if not TRUST_FILE.exists():
+    try:
+        doc = json.loads(TRUST_FILE.read_text())
+        policy = effective_policy(accept_policy(doc, ROOT_PUB, AUTH_DB.with_name("trust-state.sqlite3")))
+        trusted_key(policy, key_id)
+        return policy["keys"][key_id]["status"]
+    except Exception:
         return "unknown"
-    mtime = TRUST_FILE.stat().st_mtime
-    if (_trust_cache["data"] is None or _trust_cache["mtime"] != mtime
-            or time.time() - _trust_cache["at"] > 2):
-        try:
-            _trust_cache.update({"data": json.loads(TRUST_FILE.read_text()),
-                                 "mtime": mtime, "at": time.time()})
-        except Exception:
-            return "unknown"
-    info = (_trust_cache["data"].get("keys", {}) or {}).get(key_id)
-    return (info or {}).get("status", "unknown")
 
 
 # ---------- 配额与幂等 ----------

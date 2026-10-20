@@ -36,14 +36,11 @@ from installer import (
 # 向后兼容别名：旧脚本（13-mixed-scenario）仍 `from simulator import ensure_enrolled`
 ensure_enrolled = enroll
 
-VEHICLE_COUNT = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+VEHICLE_COUNT = 10  # Parse command-line arguments only when actually running the simulator.
 START_IDX = int(os.environ.get("OTA_SIM_START_IDX", "0"))
 EVIDENCE_DIR = ROOT / "evidence" / "raw"
 
-# ---------- ECU 密钥池 ----------
-ECU_POOL = ROOT / "pki" / "ecu-pool"
-ECU_DEMO_KEY = ROOT / "pki" / "ecu-demo" / "ecu.key"
-ECU_DEMO_PASS = "ecupass"
+# ---------- 车端密钥与时间公钥 ----------
 TIME_PUB = ROOT / "pki" / "time-v1" / "time.pub"
 
 # SM4 密钥缓存（同一 (vin, wrapped_hex) 只解一次）
@@ -51,15 +48,12 @@ _SM4_KEY_CACHE = {}
 
 
 def _ecu_key_path(vin: str):
-    """返回 (key_path, key_pass)。优先本地 PoP 密钥，其次服务端池，最后 demo。"""
+    """只使用该车辆本地的 PoP 私钥。"""
     safe = _safe_vin(vin)
     local_key = ECU_LOCAL / safe / "ecu.key"
     if local_key.exists():
         return local_key, f"localpass-{safe}"
-    key = ECU_POOL / safe / "ecu.key"
-    if key.exists():
-        return key, f"ecupass-{safe}"
-    return ECU_DEMO_KEY, ECU_DEMO_PASS
+    raise RuntimeError("device private key missing; no cloud/demo fallback")
 
 
 def sm2_decrypt(wrapped_hex: str, vin: str) -> str:
@@ -219,7 +213,7 @@ def _report(vin, task_id, manifest, trusted_ts, status, sequence, extra=None):
         "new_rollback_index": manifest["rollback_index"],
         "payload_sm3": manifest["sm3"],
         "nonce": os.urandom(16).hex(),
-        "client_ts": trusted_ts,
+        "client_ts": int(time.time()),
         "sequence": sequence,
     }
     payload.update(extra or {})
@@ -322,6 +316,12 @@ def simulate_one_vehicle(idx):
         # 5.5 初始化车端分区（首次：出厂 Slot A + boot_state）
         init_vehicle(vin, manifest, dec_path)
 
+        # Recheck current signed policy after a long download, before installation.
+        ok, reason = verify_manifest_vehicle_side(
+            vin, manifest, task["manifest_sig_hex"], key_id, local_rollback)
+        if not ok:
+            raise RuntimeError("preinstall_policy_rejected: " + reason)
+
         # 6. 写备用分区：只有下载 + 验签 + 完整性全部通过后才落盘
         t_i = time.time()
         target_slot = install_standby(
@@ -388,6 +388,10 @@ def simulate_one_vehicle(idx):
 
 
 def main():
+    global VEHICLE_COUNT
+    VEHICLE_COUNT = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+    if VEHICLE_COUNT < 1:
+        raise SystemExit('Vehicle count must be positive')
     print("=" * 60)
     print("  车辆完整升级流程模拟器（验签→写备用分区→重启自检→提交/回退）")
     print("=" * 60)

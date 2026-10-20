@@ -16,6 +16,26 @@ def admin_headers():
     return {"X-Admin-Token": token}
 
 
+def publish_policy(states, grace_seconds=60):
+    """Only on the offline admin host; does not give root secrets to the API."""
+    command = [sys.executable, str(ROOT / 'scripts/17-security-admin.py'), 'policy',
+               '--grace-seconds', str(grace_seconds)]
+    for kid, status in states.items():
+        command += ['--key', f'{kid}={status}']
+    subprocess.run(command, check=True)
+    import urllib.request
+    with urllib.request.urlopen(f'{OTA_API}/trust-metadata', timeout=10) as response:
+        return {'trust_metadata': json.load(response)}
+
+
+def ensure_devices(vins):
+    """Preflight only: a test must not approve identities on the administrator's behalf."""
+    missing = [vin for vin in vins if not (ROOT / 'pki/device-registry' / (vin + '.json')).exists()]
+    if missing:
+        raise SystemExit('Devices must be provisioned before this test. First missing VIN: ' +
+                         missing[0] + '; use scripts/17-security-admin.py provision --vin VIN')
+
+
 def issue_grant(key_id, max_tasks=1000, hours=2):
     r = subprocess.run([
         sys.executable, str(ROOT / "scripts/15-release-authorize.py"), "issue",

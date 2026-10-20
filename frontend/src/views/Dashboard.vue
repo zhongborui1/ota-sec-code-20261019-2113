@@ -15,15 +15,15 @@
     </div>
 
     <div class="card">
-      <h2>密钥池概览</h2>
+      <h2>信任与设备概览</h2>
       <table>
         <tr><th>指标</th><th>值</th></tr>
         <tr><td>签名密钥（active）</td><td>{{ summary.trust_status_count?.active || 0 }}</td></tr>
         <tr><td>签名密钥（deprecated）</td><td>{{ summary.trust_status_count?.deprecated || 0 }}</td></tr>
         <tr><td>签名密钥（prepared）</td><td>{{ summary.trust_status_count?.prepared || 0 }}</td></tr>
         <tr><td>签名密钥（revoked）</td><td>{{ summary.trust_status_count?.revoked || 0 }}</td></tr>
-        <tr><td>ECU 密钥池（服务端公钥）</td><td>{{ summary.ecu_pool_size || 0 }}</td></tr>
-        <tr><td>ECU 本地密钥（车辆）</td><td>{{ summary.ecu_local_size || 0 }}</td></tr>
+        <tr><td>预登记设备</td><td>{{ summary.ecu_pool_size || 0 }}</td></tr>
+        <tr><td>曾完成 PoP 注册设备</td><td>{{ summary.ecu_local_size || 0 }}</td></tr>
       </table>
     </div>
 

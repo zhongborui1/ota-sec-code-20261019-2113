@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 OTA API：业务逻辑层，不接触私钥。
-- 信任元数据：Redis 为权威源，本地短缓存 2s（防每请求打 Redis）
-- 轮换：SET 新值 + PUBLISH 通知，所有 worker 立即刷新
+- 信任元数据：只读根签名策略 + SQLite 单调版本记录
+- 轮换：离线发布策略，在线服务不可修改信任授权
 - 审计：所有签名/验签操作写 Postgres audit_log
-- ECU 密钥池：按 VIN 动态生成（一车一密钥），通过 signing-service 管理
+- ECU 身份：离线预登记公钥，私钥仅保存在车辆侧
 """
 import os
 import sys
@@ -12,7 +12,6 @@ import json
 import hmac
 import hashlib
 import time
-import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -27,6 +26,12 @@ from minio.error import S3Error
 import io
 
 from svc_client import SigningClient, admin_token
+from ota_common.trust import (SecurityError, accept_policy, effective_policy, atomic_json,
+                              device_record, enrollment_message, trusted_key)
+from ota_common.reports import validate_report, persist_report
+ROOT_PUB = Path(os.environ.get("ROOT_PUB", "/keys/root.pub"))
+TRUST_STATE = Path(os.environ.get("TRUST_STATE", "/data/tasks/trust-state.sqlite3"))
+DEVICE_REGISTRY = Path(os.environ.get("DEVICE_REGISTRY", "/keys/device-registry"))
 
 app = Flask(__name__)
 
@@ -61,16 +66,7 @@ MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin123")
 MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "ota-packages")
 
-TRUST_REDIS_KEY = "ota:trust-metadata"
-TRUST_CHANNEL = "ota:trust-update"
-LOCAL_CACHE_TTL = 2.0   # 本地缓存 2 秒，防止每请求打 Redis
-
-# 宽限期：旧密钥停止使用后多久转 revoked
-GRACE_PERIOD_S = int(os.environ.get("GRACE_PERIOD_S", "240"))
-CLEANUP_INTERVAL_S = int(os.environ.get("CLEANUP_INTERVAL_S", "10"))
-assert GRACE_PERIOD_S + CLEANUP_INTERVAL_S < 300, (
-    f"GRACE_PERIOD_S({GRACE_PERIOD_S}) + CLEANUP_INTERVAL_S({CLEANUP_INTERVAL_S}) 必须 < 300s"
-)
+LOCAL_CACHE_TTL = 0  # 撤销截止时间由签名策略确定，不依赖清理线程。
 
 
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,145 +90,34 @@ if STORAGE_BACKEND == "minio":
         minio_client = None
 
 # ---------- 本地缓存 ----------
-_trust_cache = {"data": None, "loaded_at": 0.0}
 _consistency_cache = {}
-_trust_lock = threading.Lock()
-
-
-def _default_trust():
-    return {
-        "trust_anchor_version": 1,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "keys": {
-            "ota-signing-v1": {"status": "active",
-                               "not_before": "2026-09-28T00:00:00Z",
-                               "not_after": "2027-09-28T00:00:00Z"},
-            "ota-signing-v2": {"status": "prepared",
-                               "not_before": "2026-09-28T00:00:00Z",
-                               "not_after": "2028-09-28T00:00:00Z"},
-        },
-    }
 
 
 def _read_trust_disk():
-    if not TRUST_FILE.exists():
-        TRUST_FILE.write_text(json.dumps(_default_trust(), indent=2))
-    return json.loads(TRUST_FILE.read_text())
+    # No unsigned defaults and no Redis fallback that could resurrect a revoked key.
+    try:
+        doc = json.loads(TRUST_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        raise SecurityError("trusted_policy_unavailable") from exc
+    return effective_policy(accept_policy(doc, ROOT_PUB, TRUST_STATE))
 
 
 def get_trust(force_refresh=False):
-    """
-    信任元数据来源优先级：本地短缓存 → Redis → 磁盘
-    - 本地缓存 TTL=2s，所有 worker 每隔 2s 最多打一次 Redis
-    - Redis 是权威源；轮换时 SET + PUBLISH
-    """
-    now = time.time()
-    with _trust_lock:
-        if (not force_refresh and _trust_cache["data"] is not None
-                and (now - _trust_cache["loaded_at"]) < LOCAL_CACHE_TTL):
-            return _trust_cache["data"]
-
-    # 读 Redis
-    raw = None
-    try:
-        raw = r.get(TRUST_REDIS_KEY)
-    except Exception:
-        raw = None
-
-    if raw:
-        data = json.loads(raw)
-    else:
-        # Redis 空：从磁盘初始化
-        data = _read_trust_disk()
-        try:
-            r.set(TRUST_REDIS_KEY, json.dumps(data))
-        except Exception as e:
-            print(f"[TRUST-REDIS-SET-ERROR] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-
-    with _trust_lock:
-        _trust_cache["data"] = data
-        _trust_cache["loaded_at"] = now
-    return data
+    return _read_trust_disk()
 
 
 def get_active_key_id():
     trust = get_trust()
     for key_id, info in trust["keys"].items():
         if info.get("status") == "active":
+            trusted_key(trust, key_id)
             return key_id
     return None
 
 
-def _redis_subscriber():
-    """后台订阅轮换通知，收到立即失效本地缓存。"""
-    try:
-        pubsub = r.pubsub()
-        pubsub.subscribe(TRUST_CHANNEL)
-        for msg in pubsub.listen():
-            if msg["type"] == "message":
-                with _trust_lock:
-                    _trust_cache["loaded_at"] = 0
-    except Exception as e:
-        import traceback
-        print(f"[REDIS-SUBSCRIBER-ERROR] {type(e).__name__}: {e}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-
-
-def _run_cleanup_once():
-    """扫描 trust，把宽限期已过的 deprecated 密钥转为 revoked。"""
-    trust = get_trust(force_refresh=True)
-    now = datetime.utcnow()
-    changed = False
-    for key_id, info in trust.get("keys", {}).items():
-        if info.get("status") != "deprecated":
-            continue
-        dep_raw = info.get("deprecated_at")
-        if not dep_raw:
-            continue
-        if dep_raw.endswith("Z"):
-            dep_raw = dep_raw[:-1]
-        try:
-            dep_dt = datetime.fromisoformat(dep_raw)
-        except ValueError:
-            continue
-        if (now - dep_dt).total_seconds() >= GRACE_PERIOD_S:
-            info["status"] = "revoked"
-            info["revoked_at"] = now.isoformat() + "Z"
-            changed = True
-    if not changed:
-        return
-    trust["updated_at"] = now.isoformat() + "Z"
-    TRUST_FILE.write_text(json.dumps(trust, indent=2))
-    r.set(TRUST_REDIS_KEY, json.dumps(trust))
-    r.publish(TRUST_CHANNEL, json.dumps(trust))
-    with _trust_lock:
-        _trust_cache["loaded_at"] = 0
-    print(f"[GRACE-CLEANUP] pid={os.getpid()} 已把到期 deprecated 密钥转为 revoked",
-          flush=True)
-
-
-def _grace_period_cleanup():
-    """后台线程：每 CLEANUP_INTERVAL_S 秒触发一次清理。
-    gunicorn 多 worker 下用 Redis SET NX 锁保证同一时刻只有一个 worker 真正执行。
-    """
-    lock_key = "ota:cleanup-lock"
-    while True:
-        time.sleep(CLEANUP_INTERVAL_S)
-        try:
-            got = r.set(lock_key, str(os.getpid()), nx=True,
-                        ex=max(2, CLEANUP_INTERVAL_S * 2))
-            if not got:
-                continue
-            try:
-                _run_cleanup_once()
-            finally:
-                try:
-                    r.delete(lock_key)
-                except Exception:
-                    pass
-        except Exception as e:
-            import traceback
-            print(f"[GRACE-CLEANUP-ERROR] {type(e).__name__}: {e}\n"
-                  f"{traceback.format_exc()}", file=sys.stderr, flush=True)
+@app.errorhandler(SecurityError)
+def security_error(exc):
+    return jsonify({"error": str(exc)}), 403
 
 
 # ---------- Postgres 审计 ----------
@@ -398,6 +283,9 @@ def canonical_json_bytes(obj):
 
 
 def task_path(task_id):
+    import re
+    if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", task_id):
+        raise SecurityError("invalid_task_id")
     return TASKS_DIR / f"{task_id}.json"
 
 
@@ -407,7 +295,7 @@ def load_task(task_id):
 
 
 def save_task(task_id, data):
-    task_path(task_id).write_text(json.dumps(data, indent=2))
+    atomic_json(task_path(task_id), data)
 
 
 # ---------- 接口 ----------
@@ -463,66 +351,31 @@ def rotation_state():
         "worker_pid": os.getpid(),
         "active_key_id": active,
         "trust_updated_at": trust.get("updated_at"),
-        "cache_age_s": round(time.time() - _trust_cache["loaded_at"], 2),
+        "cache_age_s": 0,
         "local_cache_ttl_s": LOCAL_CACHE_TTL,
     })
 
 
 @app.route("/trust-metadata", methods=["GET"])
 def get_trust_metadata():
-    return jsonify(get_trust(force_refresh=True))
+    try:
+        doc = json.loads(TRUST_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        raise SecurityError("trusted_policy_unavailable") from exc
+    policy = effective_policy(accept_policy(doc, ROOT_PUB, TRUST_STATE))
+    # signed document is authoritative; summary fields are display only.
+    return jsonify({**policy, "document": doc})
 
 
 @app.route("/admin/rotate-trust", methods=["POST"])
 def rotate_trust():
-    """
-    状态变更接口：必须带 X-Admin-Token。
-    令牌文件只在运维主机与 ota-api 容器内可读，车辆与服务身份都拿不到。
-    """
     supplied = request.headers.get("X-Admin-Token", "")
     expected = admin_token()
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
-        audit_log("rotate-trust", None, None, "auth_reject",
-                  {"reason": "bad_admin_token"})
         return jsonify({"error": "admin authentication required"}), 401
-
-    body = request.get_json(force=True)
-
-    if body.get("auto_rotate"):
-        import random as _random
-        current = _read_trust_disk()
-        prepared = [k for k, v in current["keys"].items() if v["status"] == "prepared"]
-        if not prepared:
-            return jsonify({"ok": False, "reason": "no_prepared_key"}), 400
-        new_active = _random.choice(prepared)
-        for k, v in current["keys"].items():
-            if v["status"] == "active":
-                v["status"] = "deprecated"
-                v["deprecated_at"] = datetime.utcnow().isoformat() + "Z"
-        current["keys"][new_active]["status"] = "active"
-        current["updated_at"] = datetime.utcnow().isoformat() + "Z"
-        new_meta = current
-    else:
-        new_meta = _read_trust_disk()
-        for key_id, updates in body.get("keys", {}).items():
-            if key_id in new_meta["keys"]:
-                new_meta["keys"][key_id].update(updates)
-            else:
-                new_meta["keys"][key_id] = updates
-        new_meta["updated_at"] = datetime.utcnow().isoformat() + "Z"
-
-    TRUST_FILE.write_text(json.dumps(new_meta, indent=2))
-    r.set(TRUST_REDIS_KEY, json.dumps(new_meta))
-    r.publish(TRUST_CHANNEL, json.dumps(new_meta))
-
-    audit_log("rotate-trust", None, None, "ok", {"new_meta": new_meta})
-
-    return jsonify({
-        "ok": True,
-        "updated_at": new_meta["updated_at"],
-        "trust_metadata": new_meta,
-        "note": "已 SET Redis + PUBLISH 通知，所有 worker 立即刷新",
-    })
+    # The API does not possess the root private key. Publish using the offline CLI.
+    return jsonify({"error": "offline_signed_policy_required",
+                    "command": "python3 scripts/17-security-admin.py policy --help"}), 409
 
 
 @app.route("/sign-manifest", methods=["POST"])
@@ -584,6 +437,10 @@ def verify_manifest():
                   "reject", {"reason": f"key_{status}"})
         return jsonify({"valid": False, "reason": f"key_{status}", "key_id": key_id})
 
+    try:
+        trusted_key(trust, key_id)
+    except SecurityError as exc:
+        return jsonify({"valid": False, "reason": str(exc), "key_id": key_id})
     manifest_bytes = canonical_json_bytes(manifest)
     verify_payload = {
         "data_hex": manifest_bytes.hex(),
@@ -607,7 +464,7 @@ def _enroll_key(nonce):
 
 
 def _token_key(token):
-    return f"ota:token:{token}"
+    return "ota:token:" + hashlib.sha256(token.encode()).hexdigest()
 
 
 def _require_auth(vin=None):
@@ -633,6 +490,10 @@ def _require_auth(vin=None):
         return None, ("invalid or expired token", 401)
     if vin is not None and bound_vin != vin:
         return None, ("token not authorized for this VIN", 403)
+    try:
+        device_record(DEVICE_REGISTRY, bound_vin)
+    except SecurityError as exc:
+        return None, (str(exc), 403)
     return bound_vin, None
 
 
@@ -643,20 +504,21 @@ def enroll_challenge():
     vin = body.get("vin")
     if not vin:
         return jsonify({"error": "missing vin"}), 400
+    device = device_record(DEVICE_REGISTRY, vin)
     nonce = os.urandom(32).hex()
     # 存 Redis，TTL 120s
     r.setex(_enroll_key(nonce), _ENROLL_TTL, vin)
     audit_log("enroll-challenge", None, vin, "ok", {"nonce_prefix": nonce[:8]})
     return jsonify({
         "nonce": nonce,
-        "statement": f"enroll:{vin}:{nonce}",
+        "statement": enrollment_message(vin, nonce, device["public_key"]).decode(),
         "expires_in": _ENROLL_TTL,
     })
 
 
 @app.route("/api/enrollment/register", methods=["POST"])
 def enroll_register():
-    """车辆提交 PoP 证明 + 公钥，服务端验签后写 ecu.pub。"""
+    """公钥须匹配离线登记记录；在线注册只验 PoP，不修改公钥。"""
     body = request.get_json(force=True)
     vin = body.get("vin")
     nonce = body.get("nonce")
@@ -664,6 +526,10 @@ def enroll_register():
     pub_pem = body.get("pub_pem")
     if not all([vin, nonce, sig_hex, pub_pem]):
         return jsonify({"error": "missing fields"}), 400
+
+    device = device_record(DEVICE_REGISTRY, vin)
+    if not isinstance(pub_pem, str) or pub_pem.strip() != device["public_key"].strip():
+        return jsonify({"error": "unapproved_public_key"}), 403
 
     # 从 Redis 取 nonce（跨 worker 共享）
     stored_vin = r.getdel(_enroll_key(nonce))
@@ -683,6 +549,7 @@ def enroll_register():
     # 签发 Bearer token（也存 Redis，TTL 24h）
     token = os.urandom(32).hex()
     r.setex(_token_key(token), 86400, vin)
+    r.set("ota:registered:" + vin, "1")
     audit_log("enroll-register", None, vin, "ok", {"pub_received": True})
     return jsonify({"token": token, "vin": vin})
 
@@ -691,7 +558,7 @@ def enroll_register():
 
 @app.route("/signing-pub/<key_id>", methods=["GET"])
 def signing_pub(key_id):
-    """代理 signing-service 的公钥拉取接口（车端信任锚更新用）。"""
+    """仅查询公钥；ECU 不将未经根签名的响应作为信任依据。"""
     st, data = signing.get_json(f"/pubkey/{key_id}")
     return jsonify(data), st
 
@@ -713,7 +580,7 @@ def request_task():
     每辆车单独签名：
     - 读 manifest 模板
     - 覆盖 vin/task_id/issued_at/key_id
-    - 确保该 VIN 对应的 ECU 密钥存在（按需生成，一车一密钥）
+    - 确保该 VIN 已离线登记公钥
     - 用该 VIN 的 ECU 公钥做 SM2 信封加密 SM4 会话密钥
     - 现场签名
     - 返回这辆车专属的 manifest + 签名
@@ -758,7 +625,7 @@ def request_task():
     manifest["key_id"] = key_id
     manifest["issued_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # 3.5 确保该 VIN 的 ECU 公钥存在（PoP 注册优先，服务端生成仅作兜底）
+    # 3.5 查询预登记公钥；禁止在线生成车端私钥兜底
     st_gen, gen_resp = call_signing_service("/ecu_keygen", {"vin": vin})
     if st_gen != 200:
         audit_log("request-task", key_id, task_id, "ecu_keygen_fail", gen_resp)
@@ -797,7 +664,7 @@ def request_task():
                "auth_id": sig_data.get("auth_id")})
 
     # 5. 分块哈希
-    chunk_count = manifest["size"] // manifest["chunk_size"]
+    chunk_count = (manifest["encrypted_size"] + manifest["chunk_size"] - 1) // manifest["chunk_size"]
     chunk_hashes = []
     for i in range(chunk_count):
         sm3_file = PACKAGES_DIR / "chunks" / f"chunk-{i:06d}.sm3"
@@ -846,152 +713,51 @@ def download_chunk(task_id, chunk_idx):
 
 @app.route("/report-status", methods=["POST"])
 def report_status():
-    """
-    状态上报：双重校验
-    - nonce 唯一性（防重放）
-    - sequence 严格递增（防乱序）
-    - client_ts 时间窗 ±300s
-    """
     body = request.get_json(force=True)
-    task_id = body.get("task_id")
-    vin = body.get("vin")
-    nonce = body.get("nonce")
-    client_ts = body.get("client_ts")
-    sequence = body.get("sequence")
-
-    if not task_id:
-        return jsonify({"error": "missing task_id"}), 400
-
-    task_data = load_task(task_id)
-    if not task_data:
-        return jsonify({"error": "unknown task"}), 404
-
-    # 设备授权：token 绑定 VIN 必须与任务 VIN 一致
-    bound_vin, auth_err = _require_auth(task_data.get("vin"))
-    if auth_err:
-        audit_log("report-status", task_data.get("key_id"), task_id,
-                  "auth_reject", {"reason": auth_err[0]})
-        return jsonify({"error": auth_err[0]}), auth_err[1]
-
-    # 1. 时间窗校验
-    if client_ts is not None:
-        server_now = int(time.time())
-        if abs(server_now - client_ts) > 300:
-            audit_log("report-status", task_data.get("key_id"), task_id,
-                      "timestamp_rejected",
-                      {"client_ts": client_ts, "server_ts": server_now})
-            return jsonify({
-                "error": "timestamp out of window",
-                "client_ts": client_ts,
-                "server_ts": server_now,
-                "window_s": 300,
-            }), 400
-
-    # 2. nonce 唯一性
-    if nonce and vin and DATABASE_URL:
-        try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO report_nonces (ecu_id, nonce) VALUES (%s, %s)",
-                (vin, nonce))
-            conn.commit()
-            cur.close()
+    if not isinstance(body, dict) or not isinstance(body.get("task_id"), str):
+        return jsonify({"error": "task_id_required"}), 400
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", body["task_id"]):
+        return jsonify({"error": "invalid_task_id"}), 400
+    vin, err = _require_auth()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    task = load_task(body["task_id"])
+    if not task:
+        return jsonify({"error": "unknown_task"}), 404
+    try:
+        validate_report(body, vin, task)
+    except SecurityError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not DATABASE_URL:
+        return jsonify({"error": "report_store_unavailable"}), 503
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        updated = persist_report(conn, body, task, vin)
+    except (SecurityError, psycopg2.IntegrityError) as exc:
+        return jsonify({"error": str(exc) if isinstance(exc, SecurityError) else "replayed_nonce"}), 409
+    except Exception:
+        app.logger.exception("report transaction failed")
+        return jsonify({"error": "report_store_unavailable"}), 503
+    finally:
+        if conn is not None:
             conn.close()
-        except psycopg2.IntegrityError:
-            audit_log("report-status", task_data.get("key_id"), task_id,
-                      "replay_rejected", {"vin": vin, "nonce": nonce[:16]})
-            return jsonify({"error": "replay detected", "task_id": task_id}), 409
-        except Exception as e:
-            print(f"[WARN] nonce check failed: {e}", file=sys.stderr)
-
-    # 3. sequence 严格递增
-    if sequence is not None and vin and DATABASE_URL:
-        try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT max_seq FROM report_sequences "
-                "WHERE vin=%s AND task_id=%s FOR UPDATE",
-                (vin, task_id))
-            row = cur.fetchone()
-            last_seq = row[0] if row else 0
-            if sequence <= last_seq:
-                conn.rollback()
-                cur.close()
-                conn.close()
-                audit_log("report-status", task_data.get("key_id"), task_id,
-                          "sequence_rejected",
-                          {"vin": vin, "last_seq": last_seq, "got": sequence})
-                return jsonify({
-                    "error": "sequence rollback",
-                    "last_seq": last_seq,
-                    "got": sequence,
-                }), 409
-            cur.execute(
-                """INSERT INTO report_sequences (vin, task_id, max_seq)
-                   VALUES (%s, %s, %s)
-                   ON CONFLICT (vin, task_id)
-                   DO UPDATE SET max_seq = EXCLUDED.max_seq, updated_at = NOW()""",
-                (vin, task_id, sequence))
-            conn.commit()
-            cur.close()
-            conn.close()
-        except Exception as e:
-            print(f"[WARN] sequence check failed: {e}", file=sys.stderr)
-
-    task_data["status"] = body.get("status")
-    task_data["reported_at"] = datetime.utcnow().isoformat() + "Z"
-    save_task(task_id, task_data)
-    audit_log("report-status", task_data.get("key_id"), task_id,
-              body.get("status"), body)
-    return jsonify({"ok": True, "task_id": task_id,
-                    "status": body.get("status")})
+    # DB is authoritative. JSON is only a compatibility projection for existing tools.
+    try:
+        atomic_json(task_path(task["task_id"]), updated)
+    except OSError:
+        app.logger.exception("report JSON projection failed; database commit retained")
+    return jsonify({"ok": True, "task_id": task["task_id"], "status": body["status"]})
 
 @app.route("/admin/devices", methods=["GET"])
 def admin_devices():
-    """列出所有设备：从 ecu-local（车辆本地）和 ecu-pool（服务端）扫描"""
-    import os as _os
-    devices = {}
-    local_dir = Path("/keys/ecu-local")
-    pool_dir = Path("/keys/ecu-pool")
-
-    # 从 ecu-local 扫描
-    if local_dir.exists():
-        for d in sorted(local_dir.iterdir()):
-            if not d.is_dir():
-                continue
-            vin = d.name
-            devices[vin] = {
-                "vin": vin,
-                "has_local_key": (d / "ecu.key").exists(),
-                "has_token": (d / "token").exists(),
-                "has_local_pub": (d / "ecu.pub").exists(),
-                "has_server_pub": (pool_dir / vin / "ecu.pub").exists(),
-                "has_server_key": (pool_dir / vin / "ecu.key").exists(),
-                "enrolled": (d / "token").exists() and (pool_dir / vin / "ecu.pub").exists(),
-            }
-
-    # 从 ecu-pool 补充（有 pub 但 local 里没有的）
-    if pool_dir.exists():
-        for d in sorted(pool_dir.iterdir()):
-            if not d.is_dir() or d.name in devices:
-                continue
-            vin = d.name
-            devices[vin] = {
-                "vin": vin,
-                "has_local_key": False,
-                "has_token": False,
-                "has_local_pub": False,
-                "has_server_pub": (d / "ecu.pub").exists(),
-                "has_server_key": (d / "ecu.key").exists(),
-                "enrolled": False,
-            }
-
-    return jsonify({
-        "count": len(devices),
-        "devices": list(devices.values()),
-    })
+    devices = []
+    for path in sorted(DEVICE_REGISTRY.glob("*.json")):
+        record = json.loads(path.read_text())
+        devices.append({"vin": record["vin"], "enabled": record.get("enabled", False),
+                        "enrolled": bool(r.exists("ota:registered:" + record["vin"]))})
+    return jsonify({"count": len(devices), "devices": devices})
 
 
 @app.route("/admin/summary", methods=["GET"])
@@ -1004,11 +770,10 @@ def admin_summary():
         s = info["status"]
         status_count[s] = status_count.get(s, 0) + 1
 
-    # 密钥池大小
-    pool_dir = Path("/keys/ecu-pool")
-    pool_size = len([d for d in pool_dir.iterdir() if d.is_dir()]) if pool_dir.exists() else 0
-    local_dir = Path("/keys/ecu-local")
-    local_size = len([d for d in local_dir.iterdir() if d.is_dir()]) if local_dir.exists() else 0
+    # 只统计公开登记；服务器不挂载 ECU 私钥目录。
+    pool_size = len(list(DEVICE_REGISTRY.glob("*.json")))
+    local_size = sum(bool(r.exists("ota:registered:" + p.stem))
+                     for p in DEVICE_REGISTRY.glob("*.json"))
 
     # 审计统计
     audit_stats = {}
@@ -1038,16 +803,6 @@ def admin_summary():
         "ecu_local_size": local_size,
         "audit": audit_stats,
     })
-
-
-# 启动后台线程（gunicorn -w 16 下每个 worker 各自启动：
-#   - 订阅线程：每个 worker 需独立订阅以刷新各自本地缓存
-#   - 清理线程：通过 Redis 锁保证同一时刻仅一个 worker 真正执行清理）
-_subscriber_thread = threading.Thread(target=_redis_subscriber, daemon=True)
-_subscriber_thread.start()
-
-_cleanup_thread = threading.Thread(target=_grace_period_cleanup, daemon=True)
-_cleanup_thread.start()
 
 
 if __name__ == "__main__":

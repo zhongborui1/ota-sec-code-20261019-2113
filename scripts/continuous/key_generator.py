@@ -116,4 +116,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit("Legacy online key automation retired. Use offline scripts/17-security-admin.py policy; see docs/02-security-migration.md.")

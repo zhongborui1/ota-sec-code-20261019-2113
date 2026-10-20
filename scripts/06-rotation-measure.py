@@ -11,7 +11,7 @@ from pathlib import Path
 import testlib_auth
 
 OTA_API = "http://127.0.0.1:8080"
-ROOT = Path("/home/rjh/ota-sec")
+ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "evidence" / "raw"
 EVIDENCE.mkdir(parents=True, exist_ok=True)
 LOG = EVIDENCE / f"rotation-measure-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
@@ -56,52 +56,11 @@ def run_simulator(count):
 
 
 def check_precondition():
-    """
-    前置检查：验证 manifest 签名 key_id 与 trust 元数据里的 active key 一致。
-    不一致直接报错退出，不自动修复。
-    """
-    import subprocess
-
-    # 读磁盘 manifest 里的 key_id
-    m_json = ROOT / "packages/manifests/manifest-v1.json"
-    manifest = json.loads(m_json.read_text())
-    manifest_key = manifest.get("key_id")
-
-    # 读 trust 里的 active key
-    active = http_get_json(f"{OTA_API}/health")["active_key_id"]
-
-    log(f"[前置检查] manifest.key_id = {manifest_key}")
-    log(f"[前置检查] trust.active_key_id = {active}")
-
-    if manifest_key != active:
-        log(f"[FAIL] 前置状态不一致：manifest 用 {manifest_key} 签，但 trust 里 {active} 是 active")
-        log("请先运行 ./scripts/00-prepare-rotation-test.sh")
-        raise SystemExit(1)
-
-    log("[前置检查] OK：manifest 与 trust 一致\n")
-
-
+    testlib_auth.ensure_devices([f"LSVAM4187C2{i:06d}" for i in range(100)])
 
 
 def cleanup_test_vins():
-    """清理 simulator 测试产生的临时 VIN 密钥（TM* / MIX*）"""
-    import shutil
-    pool = ROOT / "pki" / "ecu-pool"
-    local = ROOT / "pki" / "ecu-local"
-    cleaned = 0
-    for base in [pool, local]:
-        if not base.exists():
-            continue
-        for d in base.iterdir():
-            name = d.name
-            is_test = (name.startswith(("LSVAM4187C2TM", "LSVAM4187C2MIX"))
-                       or (name.startswith("LSVAM4187C2")
-                           and len(name) == 17 and name[11:].isdigit()))
-            if d.is_dir() and is_test:
-                shutil.rmtree(d, ignore_errors=True)
-                cleaned += 1
-    if cleaned:
-        print(f"[清理] 移除 {cleaned} 个测试 VIN 的 ECU 密钥")
+    print("Registered identities retained; no keys or trust ledgers deleted.")
 
 
 def main():
@@ -120,7 +79,7 @@ def main():
 
     if initial_active != "ota-signing-v1":
         log(f"[FAIL] 初始状态不是 v1，实际是 {initial_active}")
-        log("请先重置 trust 元数据")
+        log("请使用全新隔离测试目录；禁止重置已撤销密钥")
         return
 
     # 前置检查：manifest 签名必须与当前 active key 一致
@@ -138,15 +97,13 @@ def main():
     t_rotate = time.time()
     t_rotate_iso = datetime.now().isoformat()
     log(f"轮换触发时间：{t_rotate_iso}")
-    _, rotate_resp = http_post_json(f"{OTA_API}/admin/rotate-trust",
-                                    {"auto_rotate": True},
-                                    headers=testlib_auth.admin_headers())
+    rotate_resp = testlib_auth.publish_policy({"ota-signing-v1": "deprecated", "ota-signing-v2": "active"})
     log(json.dumps(rotate_resp, indent=2) + "\n")
 
     # 阶段 3：测量过渡期
     log("--- 阶段 3：测量过渡期 ---")
-    log("ota-api gunicorn worker 通过 Redis 共享信任元数据，本地缓存 TTL=2s")
-    log("轮换后各 worker 按各自过期时间刷新，出现过渡期\n")
+    log("各 worker 验证同一根签名策略，保存最高版本号")
+    log("测量各 worker 实际观察到新策略的时间\n")
 
     worker_first_v2 = {}
     all_seen_pids = set()
@@ -217,9 +174,7 @@ def main():
     log(f"        → {'宽限期内通过 ✓' if grace_ok else '异常 ✗'}\n")
 
     # 4.2 强制 v1 → revoked，应拒绝
-    _, _ = http_post_json(f"{OTA_API}/admin/rotate-trust",
-                          {"keys": {"ota-signing-v1": {"status": "revoked"}}},
-                          headers=testlib_auth.admin_headers())
+    testlib_auth.publish_policy({"ota-signing-v1": "revoked"})
     time.sleep(3)
 
     _, v1_revoked = http_post_json(f"{OTA_API}/verify-manifest", {

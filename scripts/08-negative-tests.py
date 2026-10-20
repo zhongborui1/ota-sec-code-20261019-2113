@@ -11,12 +11,12 @@ from pathlib import Path
 import testlib_auth  # 同目录脚本
 
 # 引入 simulator 的客户端校验逻辑，确保测试走真实代码路径
-sys.path.insert(0, str(Path("/home/rjh/ota-sec/services/vehicle-sim")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services/vehicle-sim"))
 from simulator import validate_received_manifest  # noqa: E402
 from ota_client import request_task, download_chunk  # noqa: E402
 
 OTA_API = "http://127.0.0.1:8080"
-ROOT = Path("/home/rjh/ota-sec")
+ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "evidence" / "raw"
 TEST_COUNT = 100
 
@@ -81,8 +81,7 @@ def ensure_v1_revoked_v2_active():
         return
         
     print("[前置] 触发真实轮换（等待宽限期结束）...")
-    http_post_json(f"{OTA_API}/admin/rotate-trust", {"auto_rotate": True},
-                   headers=testlib_auth.admin_headers())
+    testlib_auth.publish_policy({"ota-signing-v1": "deprecated", "ota-signing-v2": "active"}, grace_seconds=5)
     
     # 轮询等待 v1 变为 revoked
     max_wait = 30
@@ -330,6 +329,7 @@ def main():
     print(f"每类次数:  {TEST_COUNT}")
     print(f"时间:      {datetime.now().isoformat()}\n")
 
+    testlib_auth.ensure_devices([f"LSVAM4187C2{prefix}{i:0{6-len(prefix)}d}" for prefix in ("T", "TM", "M", "F", "D", "A", "B", "R") for i in range(TEST_COUNT)])
     ensure_v1_revoked_v2_active()
     testlib_auth.ensure_active_grant()
     print()
@@ -395,24 +395,7 @@ def main():
 
 
 def cleanup_test_vins():
-    """清理 08 测试产生的临时 VIN 密钥（LSVAM4187C2{T,TM,M,F,D,A,B,R}*）。"""
-    import shutil
-    root = Path(__file__).resolve().parents[1]
-    pool = root / "pki" / "ecu-pool"
-    local = root / "pki" / "ecu-local"
-    prefixes = ("LSVAM4187C2T", "LSVAM4187C2M", "LSVAM4187C2F",
-                "LSVAM4187C2D", "LSVAM4187C2A", "LSVAM4187C2B",
-                "LSVAM4187C2R")
-    cleaned = 0
-    for base in [pool, local]:
-        if not base.exists():
-            continue
-        for d in base.iterdir():
-            if d.is_dir() and d.name.startswith(prefixes):
-                shutil.rmtree(d, ignore_errors=True)
-                cleaned += 1
-    if cleaned:
-        print(f"[清理] 移除 {cleaned} 个测试 VIN 的 ECU 密钥")
+    print("Registered identities retained; no keys or trust ledgers deleted.")
 
 
 if __name__ == "__main__":

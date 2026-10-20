@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path("/home/rjh/ota-sec/services/vehicle-sim")))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services/vehicle-sim"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import testlib_auth  # noqa: E402
 from simulator import (validate_received_manifest, ensure_enrolled,
@@ -21,13 +21,11 @@ from simulator import (validate_received_manifest, ensure_enrolled,
                        request_task, download_chunk)  # noqa
 
 OTA_API = "http://127.0.0.1:8080"
-ROOT = Path("/home/rjh/ota-sec")
+ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "evidence" / "raw"
 VEHICLE_COUNT = 100
 
-# 13 使用 10 个固定 VIN（模拟"同一批车辆多次请求"）
-# 跑完自动清理这些 VIN 的 ECU 密钥，避免污染主密钥池
-MIX_VINS = [f"LSVAM4187C2MIX{i:04d}" for i in range(10)]
+# 测试身份必须预登记；运行后保留公钥、私钥和策略版本记录。
 
 NORMAL_TYPES = ["normal"]
 ATTACK_TYPES = ["tampered_chunk", "forged_signature", "downgrade",
@@ -79,40 +77,7 @@ def sign_manifest_locally(manifest, key_id):
 
 
 def ensure_v1_revoked_v2_active():
-    """
-    确保 v1=revoked, v2=active。
-    优先用 auto_rotate（如果有 prepared 密钥），
-    否则手动设置状态（避免 no_prepared_key 报错）。
-    """
-    with urllib.request.urlopen(f"{OTA_API}/trust-metadata", timeout=10) as r:
-        trust = json.loads(r.read().decode())
-    keys = trust.get("keys", {})
-    v1 = keys.get("ota-signing-v1", {}).get("status")
-    v2 = keys.get("ota-signing-v2", {}).get("status")
-    if v1 == "revoked" and v2 == "active":
-        return
-
-    prepared = [k for k, v in keys.items() if v.get("status") == "prepared"]
-    if prepared:
-        try:
-            http_post_json(f"{OTA_API}/admin/rotate-trust", {"auto_rotate": True},
-                           headers=testlib_auth.admin_headers())
-            return
-        except Exception:
-            pass
-
-    update = {}
-    if v1 != "revoked":
-        update["ota-signing-v1"] = {"status": "revoked"}
-    if v2 != "active":
-        for k, v in keys.items():
-            if v.get("status") == "active" and k != "ota-signing-v2":
-                update[k] = {"status": "revoked"}
-        update["ota-signing-v2"] = {"status": "active"}
-
-    if update:
-        http_post_json(f"{OTA_API}/admin/rotate-trust", {"keys": update},
-                       headers=testlib_auth.admin_headers())
+    testlib_auth.publish_policy({"ota-signing-v1": "revoked", "ota-signing-v2": "active"})
 
 
 def generate_task_assignments(n):
@@ -313,9 +278,9 @@ def attack_revoked_key(vin):
 
 
 def simulate_vehicle(idx, task_type):
-    # 从 10 个固定 VIN 池取（不同 idx 可能复用同一 VIN，模拟重复请求）
-    vin = f"LSVAM4187C2MIX{idx:04d}"
-    vin_other = f"LSVAM4187C2MIX{(idx + 50) % VEHICLE_COUNT:04d}"
+    # 每个并发车辆使用独立的预登记 VIN。
+    vin = f"LSVAM4187C2MX{idx:04d}"
+    vin_other = f"LSVAM4187C2MX{(idx + 50) % VEHICLE_COUNT:04d}"
     result = {"idx": idx, "task_type": task_type,
               "accepted": None, "reason": None, "elapsed_ms": 0}
     t0 = time.time()
@@ -390,24 +355,7 @@ def print_run_table(run_i, assignments, results, elapsed):
 
 
 def cleanup_mix_keys():
-    """
-    清理 MIX 前缀的 ECU 密钥（13 脚本产生的临时数据）。
-    避免污染主 ECU 密钥池（当前应只保留演示用的 10 台固定 VIN）。
-    """
-    pool = ROOT / "pki" / "ecu-pool"
-    local = ROOT / "pki" / "ecu-local"
-    cleaned = 0
-    if pool.exists():
-        for d in pool.iterdir():
-            if d.is_dir() and d.name.startswith("LSVAM4187C2MIX"):
-                shutil.rmtree(d, ignore_errors=True)
-                cleaned += 1
-    if local.exists():
-        for d in local.iterdir():
-            if d.is_dir() and d.name.startswith("LSVAM4187C2MIX"):
-                shutil.rmtree(d, ignore_errors=True)
-    if cleaned:
-        print(f"[清理] 移除 {cleaned} 个 MIX VIN 的 ECU 密钥")
+    print("Registered identities retained; no keys or trust ledgers deleted.")
 
 
 def main():
@@ -420,6 +368,7 @@ def main():
     print(f"轮数:    {runs}")
     print(f"开始:    {datetime.now().isoformat()}")
 
+    testlib_auth.ensure_devices([f"LSVAM4187C2MX{i:04d}" for i in range(VEHICLE_COUNT)])
     ensure_v1_revoked_v2_active()
     testlib_auth.ensure_active_grant()
     print(f"[前置] v1=revoked, v2=active")
