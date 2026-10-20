@@ -1,0 +1,118 @@
+name: ota-sec
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ota-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../data/postgres-init:/docker-entrypoint-initdb.d:ro
+    networks: [ota-internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: ota-redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redisdata:/data
+    networks: [ota-internal]
+
+  minio:
+    image: minio/minio:latest
+    container_name: ota-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+    networks: [ota-internal]
+
+  signing-service:
+    build: ../services/signing-service
+    user: "1000:1000"
+    container_name: ota-signing-service
+    environment:
+      KEY_DIR: /keys
+      V1_PASS_FILE: /keys/.secrets/signing-v1.pass
+      V2_PASS_FILE: /keys/.secrets/signing-v2.pass
+      TIME_PASS_FILE: /keys/.secrets/time-v1.pass
+      SERVICE_REGISTRY: /keys/service-auth/identities.json
+      RELEASE_ANCHOR_DIR: /keys/release-v1
+      ROOT_PUB: /keys/root.pub
+      TRUST_FILE: /data/trust/trust-metadata.json
+      AUTH_DB: /var/lib/ota-auth/authz.db
+      AUDIT_FILE: /var/lib/ota-auth/audit.jsonl
+    volumes:
+      # 只挂 root 公钥，不挂 root 私钥目录：root 保持离线
+      - ../pki/root/root.pub:/keys/root.pub:ro
+      - ../pki/signing-v1:/keys/signing-v1:ro
+      - ../pki/signing-v2:/keys/signing-v2:ro
+      - ../pki/time-v1:/keys/time-v1:ro
+      # 只挂签名密钥自己的口令；root/release 的口令不进容器
+      - ../pki/.secrets/signing-v1.pass:/keys/.secrets/signing-v1.pass:ro
+      - ../pki/.secrets/signing-v2.pass:/keys/.secrets/signing-v2.pass:ro
+      - ../pki/.secrets/time-v1.pass:/keys/.secrets/time-v1.pass:ro
+      # release 私钥不在容器内：只挂证书、签名和公钥三个文件
+      - ../pki/release-v1/release.cert.json:/keys/release-v1/release.cert.json:ro
+      - ../pki/release-v1/release.cert.sig:/keys/release-v1/release.cert.sig:ro
+      - ../pki/release-v1/release.pub:/keys/release-v1/release.pub:ro
+      - ../pki/service-auth:/keys/service-auth:ro
+      - ../pki/ecu-pool:/keys/ecu-pool:rw
+      - ../pki/ecu-local:/keys/ecu-local:ro
+      - ../pki/ecu-demo:/keys/ecu-demo:ro
+      # 授权库（nonce/配额/签名审计）与只读信任元数据
+      - ../data/signing-auth:/var/lib/ota-auth:rw
+      - ../data/trust:/data/trust:ro
+    networks: [ota-internal]
+
+  ota-api:
+    build: ../services/ota-api
+    container_name: ota-api
+    environment:
+      SIGNING_URL: http://ota-signing-service:8081
+      SIGNING_SERVICE_ID: ota-api
+      SIGNING_SECRET_FILE: /keys/service-auth/ota-api.key
+      RELEASE_GRANT_DIR: /data/release-grants
+      ADMIN_TOKEN_FILE: /keys/service-auth/admin.token
+      GRACE_PERIOD_S: "5"
+      CLEANUP_INTERVAL_S: "1"
+      PACKAGES_DIR: /data/packages
+      TASKS_DIR: /data/tasks
+      TRUST_FILE: /data/trust/trust-metadata.json
+      TRUST_TTL: "60"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      STORAGE_BACKEND: "minio"
+      MINIO_ENDPOINT: "ota-minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: "ota-packages"
+    volumes:
+      - ../packages:/data/packages:ro
+      - ../data/tasks:/data/tasks
+      - ../data/trust:/data/trust
+      - ../data/release-grants:/data/release-grants:ro
+      - ../pki/service-auth:/keys/service-auth:ro
+      - ../pki/ecu-pool:/keys/ecu-pool:ro
+      - ../pki/ecu-local:/keys/ecu-local:ro
+    networks: [ota-internal]
+    depends_on:
+      - signing-service
+      - postgres
+      - redis
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+
+networks:
+  ota-internal:
+    internal: true

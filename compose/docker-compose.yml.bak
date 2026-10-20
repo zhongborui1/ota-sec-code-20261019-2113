@@ -1,0 +1,20 @@
+name: ota-sec
+
+services:
+  signing-service:
+    build: ../services/signing-service
+    container_name: ota-signing-service
+    environment:
+      KEY_DIR: /keys
+      SIGN_PASS: v1pass
+      SIGN_ID: ota-signing-v1
+    volumes:
+      - ../pki:/keys:ro
+    networks:
+      - ota-internal
+    expose:
+      - "8081"
+
+networks:
+  ota-internal:
+    internal: true

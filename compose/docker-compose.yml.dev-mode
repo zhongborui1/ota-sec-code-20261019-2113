@@ -1,0 +1,39 @@
+name: ota-sec
+
+services:
+  signing-service:
+    build: ../services/signing-service
+    container_name: ota-signing-service
+    environment:
+      KEY_DIR: /keys
+      V1_PASS: v1pass
+      V2_PASS: v2pass
+    volumes:
+      - ../pki:/keys:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks: [ota-internal, ota-dev]
+
+  ota-api:
+    build: ../services/ota-api
+    container_name: ota-api
+    environment:
+      SIGNING_URL: http://ota-signing-service:8081
+      PACKAGES_DIR: /data/packages
+      TASKS_DIR: /data/tasks
+      TRUST_FILE: /data/trust/trust-metadata.json
+      TRUST_TTL: "60"
+    volumes:
+      - ../packages:/data/packages:ro
+      - ../data/tasks:/data/tasks
+      - ../data/trust:/data/trust
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks: [ota-internal, ota-dev]
+    depends_on: [signing-service]
+
+networks:
+  ota-internal:
+    internal: true
+  ota-dev:
+    driver: bridge

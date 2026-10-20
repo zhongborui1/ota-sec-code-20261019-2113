@@ -1,0 +1,19 @@
+# 开发/测试用：临时加一个非隔离网络 + 端口映射。
+# 交付时删除本文件，恢复纯 internal: true 隔离。
+services:
+  signing-service:
+    ports:
+      - "0.0.0.0:8081:8081"
+    networks:
+      - ota-internal
+      - ota-dev
+  ota-api:
+    ports:
+      - "0.0.0.0:8080:8080"
+    networks:
+      - ota-internal
+      - ota-dev
+
+networks:
+  ota-dev:
+    driver: bridge

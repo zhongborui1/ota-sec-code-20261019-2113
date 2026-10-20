@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+OTA API：业务逻辑层，不接触私钥。
+- 信任元数据：Redis 为权威源，本地短缓存 2s（防每请求打 Redis）
+- 轮换：SET 新值 + PUBLISH 通知，所有 worker 立即刷新
+- 审计：所有签名/验签操作写 Postgres audit_log
+"""
+import os
+import json
+import time
+import threading
+import urllib.request
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, Response
+
+import redis
+import psycopg2
+from psycopg2.extras import Json
+
+app = Flask(__name__)
+
+SIGNING_URL = os.environ.get("SIGNING_URL", "http://ota-signing-service:8081")
+PACKAGES_DIR = Path(os.environ.get("PACKAGES_DIR", "/data/packages"))
+TASKS_DIR = Path(os.environ.get("TASKS_DIR", "/data/tasks"))
+TRUST_FILE = Path(os.environ.get("TRUST_FILE", "/data/trust/trust-metadata.json"))
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+TRUST_REDIS_KEY = "ota:trust-metadata"
+TRUST_CHANNEL = "ota:trust-update"
+LOCAL_CACHE_TTL = 2.0   # 本地缓存 2 秒，防止每请求打 Redis
+
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+TRUST_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# ---------- Redis ----------
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# ---------- 本地缓存 ----------
+_trust_cache = {"data": None, "loaded_at": 0.0}
+_trust_lock = threading.Lock()
+
+
+def _default_trust():
+    return {
+        "trust_anchor_version": 1,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "keys": {
+            "ota-signing-v1": {"status": "active",
+                               "not_before": "2026-09-28T00:00:00Z",
+                               "not_after": "2027-09-28T00:00:00Z"},
+            "ota-signing-v2": {"status": "prepared",
+                               "not_before": "2026-09-28T00:00:00Z",
+                               "not_after": "2028-09-28T00:00:00Z"},
+        },
+    }
+
+
+def _read_trust_disk():
+    if not TRUST_FILE.exists():
+        TRUST_FILE.write_text(json.dumps(_default_trust(), indent=2))
+    return json.loads(TRUST_FILE.read_text())
+
+
+def get_trust(force_refresh=False):
+    """
+    信任元数据来源优先级：本地短缓存 → Redis → 磁盘
+    - 本地缓存 TTL=2s，所有 worker 每隔 2s 最多打一次 Redis
+    - Redis 是权威源；轮换时 SET + PUBLISH
+    """
+    now = time.time()
+    with _trust_lock:
+        if (not force_refresh and _trust_cache["data"] is not None
+                and (now - _trust_cache["loaded_at"]) < LOCAL_CACHE_TTL):
+            return _trust_cache["data"]
+
+    # 读 Redis
+    raw = None
+    try:
+        raw = r.get(TRUST_REDIS_KEY)
+    except Exception:
+        raw = None
+
+    if raw:
+        data = json.loads(raw)
+    else:
+        # Redis 空：从磁盘初始化
+        data = _read_trust_disk()
+        try:
+            r.set(TRUST_REDIS_KEY, json.dumps(data))
+        except Exception:
+            pass
+
+    with _trust_lock:
+        _trust_cache["data"] = data
+        _trust_cache["loaded_at"] = now
+    return data
+
+
+def get_active_key_id():
+    trust = get_trust()
+    for key_id, info in trust["keys"].items():
+        if info.get("status") == "active":
+            return key_id
+    return None
+
+
+def _redis_subscriber():
+    """后台订阅轮换通知，收到立即失效本地缓存。"""
+    try:
+        pubsub = r.pubsub()
+        pubsub.subscribe(TRUST_CHANNEL)
+        for msg in pubsub.listen():
+            if msg["type"] == "message":
+                with _trust_lock:
+                    _trust_cache["loaded_at"] = 0
+    except Exception:
+        pass
+
+
+# ---------- Postgres 审计 ----------
+def audit_log(action, key_id, resource_id, result, detail=None):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO audit_log (action, key_id, resource_id, result, detail) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (action, key_id, resource_id, result, Json(detail or {})))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+# ---------- 通用工具 ----------
+def call_signing_service(path, payload_bytes, key_id=None, is_json=False):
+    url = f"{SIGNING_URL}{path}"
+    if key_id:
+        url += f"?key_id={key_id}"
+    headers = {"Content-Type": "application/json" if is_json else "application/octet-stream"}
+    req = urllib.request.Request(url, data=payload_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, {"error": e.read().decode(errors="ignore")}
+    except Exception as e:
+        return 502, {"error": f"signing service unreachable: {e}"}
+
+
+def canonical_json_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def task_path(task_id):
+    return TASKS_DIR / f"{task_id}.json"
+
+
+def load_task(task_id):
+    p = task_path(task_id)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def save_task(task_id, data):
+    task_path(task_id).write_text(json.dumps(data, indent=2))
+
+
+# ---------- 接口 ----------
+@app.route("/health", methods=["GET"])
+def health():
+    redis_ok = False
+    try:
+        r.ping()
+        redis_ok = True
+    except Exception:
+        pass
+    return jsonify({
+        "status": "ok", "service": "ota-api",
+        "active_key_id": get_active_key_id(),
+        "redis_ok": redis_ok,
+        "local_cache_ttl_s": LOCAL_CACHE_TTL,
+    })
+
+
+@app.route("/rotation-state", methods=["GET"])
+def rotation_state():
+    trust = get_trust()
+    active = None
+    for key_id, info in trust["keys"].items():
+        if info.get("status") == "active":
+            active = key_id
+    return jsonify({
+        "worker_pid": os.getpid(),
+        "active_key_id": active,
+        "trust_updated_at": trust.get("updated_at"),
+        "cache_age_s": round(time.time() - _trust_cache["loaded_at"], 2),
+        "local_cache_ttl_s": LOCAL_CACHE_TTL,
+    })
+
+
+@app.route("/trust-metadata", methods=["GET"])
+def get_trust_metadata():
+    return jsonify(get_trust(force_refresh=True))
+
+
+@app.route("/admin/rotate-trust", methods=["POST"])
+def rotate_trust():
+    body = request.get_json(force=True)
+
+    if body.get("auto_rotate"):
+        current = _read_trust_disk()
+        for key_id, info in current["keys"].items():
+            if info["status"] == "active":
+                info["status"] = "revoked"
+            elif info["status"] == "prepared":
+                info["status"] = "active"
+        current["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        new_meta = current
+    else:
+        new_meta = _read_trust_disk()
+        for key_id, updates in body.get("keys", {}).items():
+            if key_id in new_meta["keys"]:
+                new_meta["keys"][key_id].update(updates)
+        new_meta["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+    # 1) 写磁盘（持久化）
+    TRUST_FILE.write_text(json.dumps(new_meta, indent=2))
+    # 2) 写 Redis（权威源）
+    r.set(TRUST_REDIS_KEY, json.dumps(new_meta))
+    # 3) PUBLISH 通知所有 worker 立即刷新
+    r.publish(TRUST_CHANNEL, json.dumps(new_meta))
+
+    audit_log("rotate-trust", None, None, "ok", {"new_meta": new_meta})
+
+    return jsonify({
+        "ok": True,
+        "updated_at": new_meta["updated_at"],
+        "trust_metadata": new_meta,
+        "note": "已 SET Redis + PUBLISH 通知，所有 worker 立即刷新",
+    })
+
+
+@app.route("/sign-manifest", methods=["POST"])
+def sign_manifest():
+    manifest = request.get_json(force=True)
+    if not manifest:
+        return jsonify({"error": "empty manifest"}), 400
+    key_id = get_active_key_id()
+    if not key_id:
+        return jsonify({"error": "no active key"}), 500
+    manifest_bytes = canonical_json_bytes(manifest)
+    status, sig_data = call_signing_service("/sign", manifest_bytes, key_id=key_id)
+    if status != 200:
+        audit_log("sign-manifest", key_id, manifest.get("package_id"), "fail", sig_data)
+        return jsonify({"error": "signing failed", "detail": sig_data}), status
+    audit_log("sign-manifest", key_id, manifest.get("package_id"), "ok",
+              {"sig_len": sig_data["sig_len"]})
+    return jsonify({
+        "manifest": manifest, "key_id": key_id,
+        "sig_hex": sig_data["sig_hex"], "sig_len": sig_data["sig_len"],
+    })
+
+
+@app.route("/verify-manifest", methods=["POST"])
+def verify_manifest():
+    body = request.get_json(force=True)
+    manifest = body.get("manifest")
+    sig_hex = body.get("sig_hex")
+    key_id = body.get("key_id")
+    if not manifest or not sig_hex or not key_id:
+        return jsonify({"error": "missing args"}), 400
+
+    trust = get_trust()
+    key_info = trust["keys"].get(key_id)
+    if not key_info:
+        audit_log("verify-manifest", key_id, manifest.get("package_id"),
+                  "reject", {"reason": "unknown_key"})
+        return jsonify({"valid": False, "reason": "unknown_key", "key_id": key_id}), 400
+    status = key_info.get("status")
+    if status != "active":
+        audit_log("verify-manifest", key_id, manifest.get("package_id"),
+                  "reject", {"reason": f"key_{status}"})
+        return jsonify({"valid": False, "reason": f"key_{status}", "key_id": key_id})
+
+    manifest_bytes = canonical_json_bytes(manifest)
+    verify_payload = json.dumps({
+        "data_hex": manifest_bytes.hex(),
+        "sig_hex": sig_hex, "key_id": key_id,
+    }).encode()
+    s, result = call_signing_service("/verify", verify_payload, is_json=True)
+
+    audit_log("verify-manifest", key_id, manifest.get("package_id"),
+              "ok" if result.get("valid") else "reject",
+              {"valid": result.get("valid")})
+
+    return jsonify(result), s
+
+
+@app.route("/request-task", methods=["POST"])
+def request_task():
+    body = request.get_json(force=True)
+    vin = body.get("vin")
+    if not vin:
+        return jsonify({"error": "missing vin"}), 400
+
+    manifest_path = PACKAGES_DIR / "manifests" / "manifest-v1.json"
+    sig_path = PACKAGES_DIR / "manifests" / "manifest-v1.sig"
+    if not manifest_path.exists() or not sig_path.exists():
+        return jsonify({"error": "package not built"}), 500
+
+    manifest = json.loads(manifest_path.read_text())
+    sig_hex = sig_path.read_bytes().hex()
+    key_id = get_active_key_id()
+    if not key_id:
+        return jsonify({"error": "no active key"}), 500
+
+    chunk_count = manifest["size"] // manifest["chunk_size"]
+    chunk_hashes = []
+    for i in range(chunk_count):
+        sm3_file = PACKAGES_DIR / "chunks" / f"chunk-{i:06d}.sm3"
+        chunk_hashes.append(sm3_file.read_text().split()[0] if sm3_file.exists() else None)
+
+    task_id = f"task-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-{vin[-6:]}"
+    save_task(task_id, {"task_id": task_id, "vin": vin, "status": "issued",
+                        "key_id": key_id,
+                        "created_at": datetime.utcnow().isoformat() + "Z"})
+    audit_log("request-task", key_id, task_id, "ok", {"vin": vin})
+
+    return jsonify({
+        "task_id": task_id, "manifest": manifest, "key_id": key_id,
+        "manifest_sig_hex": sig_hex,
+        "chunk_count": chunk_count, "chunk_size": manifest["chunk_size"],
+        "chunk_hashes": chunk_hashes,
+    })
+
+
+@app.route("/download/<task_id>/<int:chunk_idx>", methods=["GET"])
+def download_chunk(task_id, chunk_idx):
+    if not load_task(task_id):
+        return jsonify({"error": "unknown task"}), 404
+    chunk_file = PACKAGES_DIR / "chunks" / f"chunk-{chunk_idx:06d}"
+    if not chunk_file.exists():
+        return jsonify({"error": "chunk not found"}), 404
+    return Response(chunk_file.read_bytes(), mimetype="application/octet-stream")
+
+
+@app.route("/report-status", methods=["POST"])
+def report_status():
+    body = request.get_json(force=True)
+    task_id = body.get("task_id")
+    if not task_id:
+        return jsonify({"error": "missing task_id"}), 400
+    task_data = load_task(task_id)
+    if not task_data:
+        return jsonify({"error": "unknown task"}), 404
+    task_data["status"] = body.get("status")
+    task_data["reported_at"] = datetime.utcnow().isoformat() + "Z"
+    save_task(task_id, task_data)
+    audit_log("report-status", task_data.get("key_id"), task_id,
+              body.get("status"), body)
+    return jsonify({"ok": True, "task_id": task_id, "status": body.get("status")})
+
+
+# 启动后台订阅线程
+_subscriber_thread = threading.Thread(target=_redis_subscriber, daemon=True)
+_subscriber_thread.start()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
